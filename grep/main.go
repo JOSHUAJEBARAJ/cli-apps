@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 type config struct {
@@ -16,13 +17,12 @@ type config struct {
 	output         string
 	case_sensitive bool
 }
+
 type result struct {
 	lines             []string
 	filename          string
 	printwithfilename bool
 }
-
-type results []result
 
 func parseFlags() config {
 	o := flag.String("o", "", "To send the output to the file")
@@ -32,12 +32,7 @@ func parseFlags() config {
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
-	// if flag.NArg() == 0 {
-	// 	flag.Usage()
-	// 	os.Exit(1)
-	// }
 	input_search_text := flag.Arg(0)
-
 	filename := flag.Arg(1)
 	c := config{search_string: input_search_text, filename: filename, output: *o, case_sensitive: *i}
 	return c
@@ -54,7 +49,8 @@ func openFile(c config) (*os.File, error) {
 	return f, nil
 }
 
-func search(r io.Reader, c config) ([]string, error) {
+func search(r io.Reader, c config, wg *sync.WaitGroup, resultsChan chan<- result, mu *sync.Mutex) {
+	defer wg.Done()
 	scanner := bufio.NewScanner(r)
 	lines := []string{}
 	for scanner.Scan() {
@@ -67,19 +63,36 @@ func search(r io.Reader, c config) ([]string, error) {
 				lines = append(lines, scanner.Text())
 			}
 		}
-
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, err
+		fmt.Fprintf(os.Stderr, "Error searching %s: %v\n", c.filename, err)
+		return
 	}
-	return lines, nil
+
+	// Protect the critical section with a mutex lock
+	mu.Lock()
+	resultsChan <- result{lines: lines, filename: c.filename, printwithfilename: true}
+	mu.Unlock()
 }
 
+func walk(path string) (allFiles []string) {
+	filepath.Walk(path, func(file string, info os.FileInfo, err error) error {
+		// skip the root
+		if info.IsDir() {
+			return nil
+		}
+		if file != path {
+			allFiles = append(allFiles, file)
+		}
+		return nil
+	})
+	return allFiles
+}
 func printresult(c config, r result) {
 	if c.output == "" {
 		for _, line := range r.lines {
 			if r.printwithfilename {
-				fmt.Printf("%s : %s\n", c.filename, line)
+				fmt.Printf("%s : %s\n", r.filename, line)
 			} else {
 				fmt.Println(line)
 			}
@@ -95,7 +108,7 @@ func printresult(c config, r result) {
 	writer := bufio.NewWriter(outputFile)
 	for _, line := range r.lines {
 		if r.printwithfilename {
-			_, err := writer.WriteString(c.filename + ":" + line + "\n")
+			_, err := writer.WriteString(r.filename + ":" + line + "\n")
 			if err != nil {
 				handleError(err)
 			}
@@ -105,7 +118,6 @@ func printresult(c config, r result) {
 				handleError(err)
 			}
 		}
-
 	}
 	err = writer.Flush()
 	if err != nil {
@@ -113,28 +125,18 @@ func printresult(c config, r result) {
 	}
 }
 
-func walk(path string) (allFiles []string) {
-	filepath.Walk(path, func(file string, info os.FileInfo, err error) error {
-		// skip the root
-		if info.IsDir() {
-			return nil
-		}
-		if file != path {
-			allFiles = append(allFiles, file)
-		}
-
-		return nil
-	})
-	return allFiles
-}
 func main() {
 	c := parseFlags()
-	r := result{}
-	// check if the filename is directory
+	var wg sync.WaitGroup
+	resultsChan := make(chan result, 100) // Buffered channel to hold results
+	var mu sync.Mutex
+
+	// Check if the filename is a directory
 	info, err := os.Stat(c.filename)
 	if err != nil {
 		handleError(err)
 	}
+
 	if info.IsDir() {
 		files := walk(c.filename)
 		for _, file := range files {
@@ -143,32 +145,29 @@ func main() {
 			if err != nil {
 				handleError(err)
 			}
-			r.printwithfilename = true
-			defer f.Close() // Close the file when we're done with it
-			r.filename = c.filename
-			r.lines, err = search(f, c)
-			if err != nil {
-				handleError(err)
-			}
-
-			printresult(c, r)
+			wg.Add(1)
+			go search(f, c, &wg, resultsChan, &mu)
 		}
-		return
+	} else {
+		wg.Add(1)
+		f, err := openFile(c)
+		if err != nil {
+			handleError(err)
+		}
+		go search(f, c, &wg, resultsChan, &mu)
 	}
-	f, err := openFile(c)
-	if err != nil {
-		handleError(err)
-	}
-	defer f.Close() // Close the file when we're done with it
 
-	r.lines, err = search(f, c)
-	if err != nil {
-		handleError(err)
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+	}()
+
+	for res := range resultsChan {
+		printresult(c, res)
 	}
-	printresult(c, r)
 }
 
 func handleError(err error) {
-	fmt.Println(os.Stderr, "Error:", err)
+	fmt.Fprintln(os.Stderr, "Error:", err)
 	os.Exit(1)
 }
